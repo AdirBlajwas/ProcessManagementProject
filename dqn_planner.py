@@ -189,9 +189,12 @@ class DQNPlanner(Planner):
         self._update_diagnosis_queues(to_plan, to_replan, now)
         state, mask, plan_actions, sched_actions = self._build_structured_state(now)
         action = self._select_action(state, mask)
-        plan_count = len(plan_actions)
+        plan_count = self.total_slots * 24
         if action < plan_count:
-            case_id, adm_time = plan_actions[action]
+            chosen = plan_actions[action]
+            if chosen is None:
+                return []
+            case_id, adm_time = chosen
             self._remember_pending(now, state, action, mask, {'case_id': case_id}, 'plan')
             diagnosis = self.diagnosis_dict.get(case_id, 'No diagnosis')
             if case_id in self.diagnosis_queues[diagnosis]:
@@ -226,9 +229,12 @@ class DQNPlanner(Planner):
     def schedule(self, now):
         state, mask, plan_actions, sched_actions = self._build_structured_state(now)
         action = self._select_action(state, mask)
-        plan_count = len(plan_actions)
+        plan_count = self.total_slots * 24
         if action < plan_count:
-            case_id, adm_time = plan_actions[action]
+            chosen = plan_actions[action]
+            if chosen is None:
+                return []
+            case_id, adm_time = chosen
             self._remember_pending(now, state, action, mask, {'case_id': case_id}, 'plan')
             diagnosis = self.diagnosis_dict.get(case_id, 'No diagnosis')
             if case_id in self.diagnosis_queues[diagnosis]:
@@ -373,7 +379,8 @@ class DQNPlanner(Planner):
                            dtype=torch.float32).unsqueeze(0)
 
         # ------------------- ACTION ENCODING -------------------------
-        plan_actions  = []   # [(cid, adm_time)]
+        total_plan_slots = self.total_slots * 24
+        plan_actions  = [None] * total_plan_slots
         sched_actions = []   # [((or,a,b), t_eff)]
         mask          = torch.zeros(self.action_dim, dtype=torch.uint8).unsqueeze(0)
 
@@ -387,11 +394,10 @@ class DQNPlanner(Planner):
                     earliest = now + 24     # ≥ one day ahead
                     for h in range(24):     # 24 hourly slots
                         adm = earliest + h
-                        plan_actions.append((case_id, adm))
-                        if adm >= earliest: mask[0, idx] = 1
+                        plan_actions[idx] = (case_id, adm)
+                        mask[0, idx] = 1
                         idx += 1
                 else:
-                    # Empty slot - no valid actions
                     idx += 24
 
         # 2. Schedule actions: set OR, A_BED, B_BED together
