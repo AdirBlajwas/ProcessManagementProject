@@ -1,0 +1,7 @@
+/.DS_Store
+/.idea
+/.vscode
+/Pipfile
+/__pycache__
+/process_management_project.egg-info
+/venv
