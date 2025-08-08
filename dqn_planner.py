@@ -1,14 +1,19 @@
 # dqn_planner.py
-import math, random, collections, pickle, os, torch, torch.nn as nn, torch.optim as optim
+import math, random, collections, os
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from planners import Planner
-from problems import ResourceType
-from datetime import datetime
+from problems import ResourceType, HealthcareElements
+from simulator import EventType
 
 # --------------------------------------------------------------------- #
 #  1. Replay buffer                                                     #
 # --------------------------------------------------------------------- #
-Transition = collections.namedtuple('Transition',
-                                    ('state', 'action', 'reward', 'next_state', 'done', 'mask'))
+Transition = collections.namedtuple(
+    'Transition',
+    ('state', 'action', 'reward', 'next_state', 'done', 'mask', 'next_mask')
+)
 
 class ReplayMemory:
     def __init__(self, capacity=200_000):
@@ -73,14 +78,6 @@ class DQNPlanner(Planner):
         self.max_queue_len  = max_queue_len   # cut tail to keep state small
         self.step_counter   = 0
 
-        # ---- bookkeeping for KPIs -------------------------------------
-        self.wait_intake     = collections.defaultdict(float)  # hrs waited
-        self.wait_in_hosp    = collections.defaultdict(float)
-        self.plan_times      = {}                              # case_id -> tp
-        self.replan_penalty  = 0
-        self.cost            = 0
-        self.last_ts         = 0
-
         # ---- diagnosis tracking and per-diagnosis queues --------------
         self.diagnosis_dict = {}  # case_id -> diagnosis
         self.arrival_times = {}   # case_id -> arrival_time
@@ -89,40 +86,37 @@ class DQNPlanner(Planner):
             'B1': 4, 'B2': 5, 'B3': 6, 'B4': 7,
             'No diagnosis': 8
         }
-        
-        # Per-diagnosis queues ordered by arrival time (FIFO)
+
         self.diagnosis_queues = {
-            'A1': collections.deque(), 'A2': collections.deque(), 
+            'A1': collections.deque(), 'A2': collections.deque(),
             'A3': collections.deque(), 'A4': collections.deque(),
-            'B1': collections.deque(), 'B2': collections.deque(), 
+            'B1': collections.deque(), 'B2': collections.deque(),
             'B3': collections.deque(), 'B4': collections.deque(),
             'No diagnosis': collections.deque()
         }
-        
-        # Configuration for state slots per diagnosis
-        # Based on typical distribution: A1(30%), B1(25%), B2(15%), others(30%)
+
         self.slots_per_diagnosis = {
             'A1': 3, 'A2': 1, 'A3': 1, 'A4': 1,
             'B1': 2, 'B2': 1, 'B3': 1, 'B4': 1,
             'No diagnosis': 1
         }
-        
-        # Total slots for state representation
+
         self.total_slots = sum(self.slots_per_diagnosis.values())  # 12 slots
 
-        # ---- delayed reward tracking ----------------------------------
-        self.pending_actions = []  # [(timestamp, state, action, mask, case_id, action_type)]
-        self.action_outcomes = {}  # case_id -> outcome tracking
-        self.simulation_start_time = 0  # Track simulation duration for normalization
+        # ---- pending actions & clocks ---------------------------------
+        self.pending_actions = []  # list of (ts, state, action, mask, meta, typ)
+        self.arrival_ts = {}       # case_id -> arrival ts
+        self.wta_open = set()      # case_ids awaiting intake
+        self.wth_start = {}        # case_id -> activation ts
+        self.schedule_history = []
 
         # ---- resources -------------------------------------------------
-        self.resources_now   = {rt:0 for rt in ResourceType}   # current plan
+        self.resources_now   = {rt:0 for rt in ResourceType}
         self.future_plan     = collections.defaultdict(dict)   # t -> {rt:n}
 
         # ---- RL parts --------------------------------------------------
-        # New state dimension: slots + diagnosis features + resource info + time features
-        self.state_dim = (self.total_slots * 2) + 9 + len(ResourceType) + 9  # slots + diagnosis counts + resources + time
-        self.action_dim = (self.total_slots * 24) + 27  # plan actions + schedule actions
+        self.state_dim = (self.total_slots * 2) + 9 + len(ResourceType) + 9
+        self.action_dim = (self.total_slots * 24) + 27
         self.net   = Net(self.state_dim, self.action_dim)
         self.tgt   = Net(self.state_dim, self.action_dim)
         self.tgt.load_state_dict(self.net.state_dict())
@@ -138,126 +132,186 @@ class DQNPlanner(Planner):
     #  REPORT  – bind simulator stream to our private counters         #
     # ================================================================ #
     def report(self, case_id, element, ts, resource, lifecycle, data=None):
-        # Track simulation start time for normalization
-        if self.simulation_start_time == 0:
-            self.simulation_start_time = ts
-            
-        # Track diagnosis information and arrival times
-        if element is not None and element.label in ['emergency_patient', 'patient_referal']:
+        # Arrival of a new patient: start WTA clock
+        if element and element.label in (
+            HealthcareElements.PATIENT_REFERAL,
+            HealthcareElements.EMERGENCY_PATIENT,
+        ):
+            self.arrival_ts[case_id] = ts
+            self.wta_open.add(case_id)
             if hasattr(element, 'data') and 'diagnosis' in element.data:
-                if element.data['diagnosis'] is not None:
-                    self.diagnosis_dict[case_id] = element.data['diagnosis']
-                else:
-                    self.diagnosis_dict[case_id] = 'No diagnosis'
-                # Record arrival time
+                self.diagnosis_dict[case_id] = element.data.get('diagnosis', 'No diagnosis') or 'No diagnosis'
                 self.arrival_times[case_id] = ts
-                # Add to appropriate diagnosis queue
-                diagnosis = self.diagnosis_dict[case_id]
-                self._add_case_to_queue(case_id, diagnosis, ts)
-        
-        # elapsed since last event to accumulate waiting / cost
-        dt = ts - self.last_ts
-        for c in self.wait_intake:  self.wait_intake[c] += dt
-        for c in self.wait_in_hosp: self.wait_in_hosp[c] += dt
-        self.last_ts = ts
+                self._add_case_to_queue(case_id, self.diagnosis_dict[case_id], ts)
 
-        # track phase changes
-        from problems import HealthcareElements
-        if element:
-            if element.label == HealthcareElements.TIME_FOR_INTAKE:
-                self.wait_intake[case_id] = 0.0
-                self.plan_times[(case_id, ts)] = element.occurrence_time
-            elif element.label == HealthcareElements.INTAKE and lifecycle.name.endswith("COMPLETE"):
-                self.wait_in_hosp[case_id] = 0.0
-                self.wait_intake.pop(case_id, None)
-            elif element.label in (HealthcareElements.SURGERY,
-                                   HealthcareElements.NURSING) and lifecycle.name.endswith("COMPLETE"):
-                self.wait_in_hosp.pop(case_id, None)
+        # Intake start: compute WTA and credit last plan
+        if (
+            lifecycle == EventType.START_TASK
+            and element
+            and element.label == HealthcareElements.INTAKE
+            and case_id in self.arrival_ts
+        ):
+            wta = ts - self.arrival_ts[case_id]
+            r = -self._norm_time(wta, cap=336)
+            self._credit_last_plan(case_id, r)
+            self.wta_open.discard(case_id)
 
-        # add nervousness penalty when replanning
-        if lifecycle.name == "PLAN_UPDATED":   # fictitious name – adapt!
-            old_tp, tr = data['old_tp'], ts
-            self.replan_penalty += max(0, 336 - (old_tp - tr)) / 336
+        # Nervousness: replanning close to execution
+        if lifecycle == EventType.PLAN_EVENTS and data and 'old_tp' in data:
+            old_tp = data['old_tp']
+            nerv = max(0.0, 336 - (old_tp - ts)) / 336.0
+            self._credit_last_plan(case_id, -nerv)
 
-        # resource cost each SCHEDULE_RESOURCES
-        if lifecycle.name == "SCHEDULE_RESOURCES":
-            if data and 'cost' in data:
-                self.cost += data['cost']  # simulator gives it (see simulator.py)
-                # Assign delayed rewards for scheduling actions
-                self._assign_delayed_rewards(ts, 'schedule', data.get('cost', 0))
-        
-        # Assign delayed rewards for planning actions when cases complete
-        if element and lifecycle.name.endswith("COMPLETE"):
-            if element.label in [HealthcareElements.INTAKE, HealthcareElements.SURGERY, 
-                               HealthcareElements.NURSING, HealthcareElements.RELEASING]:
-                self._assign_delayed_rewards(ts, 'plan', case_id)
-                
-        # Track hospital waiting time for completed tasks
-        if element and lifecycle.name.endswith("COMPLETE") and element.label in [HealthcareElements.SURGERY, HealthcareElements.NURSING]:
-            if case_id in self.wait_in_hosp:
-                hospital_wait_time = self.wait_in_hosp[case_id]
-                self._assign_delayed_rewards(ts, 'hospital_wait', hospital_wait_time)
-                
-        # Track nervousness (replanning penalty)
-        if lifecycle.name == "PLAN_UPDATED" and data and 'old_tp' in data:
-            old_tp, tr = data['old_tp'], ts
-            replan_penalty = max(0, 336 - (old_tp - tr)) / 336
-            self._assign_delayed_rewards(ts, 'nervousness', replan_penalty)
+        # In-hospital waiting time tracking
+        is_hosp_task = element and element.label in (
+            HealthcareElements.SURGERY,
+            HealthcareElements.NURSING,
+        )
+        if lifecycle == EventType.ACTIVATE_TASK and is_hosp_task:
+            self.wth_start[case_id] = ts
+
+        if lifecycle == EventType.START_TASK and is_hosp_task:
+            t0 = self.wth_start.pop(case_id, None)
+            if t0 is not None:
+                wth = ts - t0
+                r = -self._norm_time(wth, cap=168)
+                self._credit_schedule_in_force(at_ts=t0, reward=r)
+
+        # Hourly cost credit
+        if lifecycle == EventType.SCHEDULE_RESOURCES and data and 'cost' in data:
+            cost_rate = data['cost'] / 264.0
+            self._credit_latest_schedule(-3.0 * cost_rate)
 
     # ================================================================ #
     #  PLAN  – always called at arbitrary sim events                   #
     # ================================================================ #
     def plan(self, to_plan, to_replan, now):
-        # Update per-diagnosis queues with new cases
         self._update_diagnosis_queues(to_plan, to_replan, now)
-        
-        # Build state from structured queues
         state, mask, plan_actions, sched_actions = self._build_structured_state(now)
         action = self._select_action(state, mask)
-        
-        #  if the chosen action is a scheduling one, ignore here
-        if action >= len(plan_actions):
-            # Track scheduling action for delayed reward
-            self.pending_actions.append((now, state, action, mask, None, 'schedule'))
-            return []
-        
-        case_id, adm_time = plan_actions[action]
-        self.plan_times[case_id] = adm_time
-        self.wait_intake[case_id] = 0.0  # start counting
-        
-        # Track planning action for delayed reward
-        self.pending_actions.append((now, state, action, mask, case_id, 'plan'))
-        
-        # Remove case from its diagnosis queue
-        diagnosis = self.diagnosis_dict.get(case_id, 'No diagnosis')
-        if case_id in self.diagnosis_queues[diagnosis]:
-            self.diagnosis_queues[diagnosis].remove(case_id)
-        
-        return [(case_id, adm_time)]
+        plan_count = self.total_slots * 24
+        if action < plan_count:
+            chosen = plan_actions[action]
+            if chosen is None:
+                return []
+            case_id, adm_time = chosen
+            self._remember_pending(now, state, action, mask, {'case_id': case_id}, 'plan')
+            diagnosis = self.diagnosis_dict.get(case_id, 'No diagnosis')
+            if case_id in self.diagnosis_queues[diagnosis]:
+                self.diagnosis_queues[diagnosis].remove(case_id)
+            return [(case_id, adm_time)]
+        else:
+            s_idx = action - plan_count
+            (new_or, new_ab, new_bb), t_eff = sched_actions[s_idx]
+            self.resources_now[ResourceType.OR] = new_or
+            self.resources_now[ResourceType.A_BED] = new_ab
+            self.resources_now[ResourceType.B_BED] = new_bb
+            self.future_plan[t_eff][ResourceType.OR] = new_or
+            self.future_plan[t_eff][ResourceType.A_BED] = new_ab
+            self.future_plan[t_eff][ResourceType.B_BED] = new_bb
+            self._remember_pending(
+                now,
+                state,
+                action,
+                mask,
+                {'t_eff': t_eff, 'triple': (new_or, new_ab, new_bb)},
+                'schedule',
+            )
+            return [
+                (ResourceType.OR, t_eff, new_or),
+                (ResourceType.A_BED, t_eff, new_ab),
+                (ResourceType.B_BED, t_eff, new_bb),
+            ]
 
     # ================================================================ #
     #  SCHEDULE – called daily 18:00                                   #
     # ================================================================ #
     def schedule(self, now):
-        state, mask, _, sched_actions = self._build_structured_state(now)
+        state, mask, plan_actions, sched_actions = self._build_structured_state(now)
         action = self._select_action(state, mask)
-        if action < len(mask)-len(sched_actions):  # intake branch chosen
-            # Track no-change action for delayed reward
-            self.pending_actions.append((now, state, action, mask, None, 'no_change'))
-            return []     # no staffing change
-        sched_action_idx = action - (self.action_dim - len(sched_actions))
-        if 0 <= sched_action_idx < len(sched_actions):
-            res_type, t_eff, n = sched_actions[sched_action_idx]
-        else:
-            # Fallback: no scheduling change
-            self.pending_actions.append((now, state, action, mask, None, 'no_change'))
-            return []
-        self.resources_now[res_type] = n
-        self.future_plan[t_eff][res_type] = n
-        
-        # Track scheduling action for delayed reward
-        self.pending_actions.append((now, state, action, mask, None, 'schedule'))
-        return [(res_type, t_eff, n)]
+        plan_count = self.total_slots * 24
+        if action < plan_count:
+            chosen = plan_actions[action]
+            if chosen is None:
+                return []
+            case_id, adm_time = chosen
+            self._remember_pending(now, state, action, mask, {'case_id': case_id}, 'plan')
+            diagnosis = self.diagnosis_dict.get(case_id, 'No diagnosis')
+            if case_id in self.diagnosis_queues[diagnosis]:
+                self.diagnosis_queues[diagnosis].remove(case_id)
+            return [(case_id, adm_time)]
+        s_idx = action - plan_count
+        (new_or, new_ab, new_bb), t_eff = sched_actions[s_idx]
+        self.resources_now[ResourceType.OR] = new_or
+        self.resources_now[ResourceType.A_BED] = new_ab
+        self.resources_now[ResourceType.B_BED] = new_bb
+        self.future_plan[t_eff][ResourceType.OR] = new_or
+        self.future_plan[t_eff][ResourceType.A_BED] = new_ab
+        self.future_plan[t_eff][ResourceType.B_BED] = new_bb
+        self._remember_pending(
+            now,
+            state,
+            action,
+            mask,
+            {'t_eff': t_eff, 'triple': (new_or, new_ab, new_bb)},
+            'schedule',
+        )
+        return [
+            (ResourceType.OR, t_eff, new_or),
+            (ResourceType.A_BED, t_eff, new_ab),
+            (ResourceType.B_BED, t_eff, new_bb),
+        ]
+
+    # ----------------------- helpers ---------------------------------
+    def _remember_pending(self, ts, state, action, mask, meta, typ):
+        self.pending_actions.append((ts, state, action, mask, meta, typ))
+
+    def _credit_last_plan(self, case_id, r):
+        for i in range(len(self.pending_actions) - 1, -1, -1):
+            ts, s, a, m, meta, typ = self.pending_actions[i]
+            if typ == 'plan' and meta and meta.get('case_id') == case_id:
+                self._push_experience(s, a, m, r)
+                self.pending_actions.pop(i)
+                return
+
+    def _credit_latest_schedule(self, r):
+        for i in range(len(self.pending_actions) - 1, -1, -1):
+            ts, s, a, m, meta, typ = self.pending_actions[i]
+            if typ == 'schedule':
+                self._push_experience(s, a, m, r)
+                return
+
+    def _credit_schedule_in_force(self, at_ts, reward):
+        chosen = None
+        for i in range(len(self.pending_actions) - 1, -1, -1):
+            ts, s, a, m, meta, typ = self.pending_actions[i]
+            if typ == 'schedule' and meta and meta.get('t_eff') <= at_ts:
+                chosen = i
+                break
+        if chosen is not None:
+            _, s, a, m, _, _ = self.pending_actions[chosen]
+            self._push_experience(s, a, m, reward)
+
+    def _push_experience(self, s, a, m, r, s2=None, done=False, m2=None):
+        if self.train_mode:
+            self.mem.push(s, a, r, s2, done, m, m2)
+            if len(self.mem) >= self.BATCH:
+                self._learn()
+
+    def _norm_time(self, dt_hours, cap):
+        return min(max(dt_hours, 0), cap) / cap
+
+    def _next_effective_time(self, now, dr_or, dr_ab, dr_bb):
+        t_eff = now + 14
+        if dr_or < 0 or dr_ab < 0 or dr_bb < 0:
+            t_eff = now + 168
+        return t_eff
+
+    def _slot_features(self, case_id, diagnosis, now):
+        waiting = now - self.arrival_times.get(case_id, now)
+        w_norm = min(waiting, 336) / 336.0
+        pr = self.diagnosis_encoding.get(diagnosis, 8) / 8.0
+        return [w_norm, pr]
 
     # ================================================================ #
     #  INTERNALS                                                       #
@@ -290,107 +344,14 @@ class DQNPlanner(Planner):
                                 key=lambda x: self.arrival_times.get(x, 0))
             self.diagnosis_queues[diagnosis] = collections.deque(sorted_queue)
     
-    def _assign_delayed_rewards(self, current_time, action_type, outcome_data):
-        """Assign delayed rewards to pending actions based on outcomes"""
-        if not self.train_mode:
-            return
-        
-        # Calculate reward based on action type and outcome
-        reward = 0
-        
-        if action_type == 'schedule':
-            # Reward based on cost efficiency (aligns with personnel_cost)
-            # Cost calculation: planned_ahead(1) + current_scheduled(2) + busy_resources(3)
-            cost = outcome_data
-            
-            # Normalize cost by simulation duration to avoid bias towards shorter runs
-            # Expected cost per hour: (5+30+40+4+9) * 1 = 88 base cost per hour
-            # Maximum cost per hour: 88 * 3 = 264 (if all resources are busy)
-            expected_hourly_cost = 88  # Base cost for all resources
-            max_hourly_cost = 264      # Maximum possible cost per hour
-            
-            # Calculate cost efficiency (lower is better)
-            cost_efficiency = max(0, (max_hourly_cost - cost) / max_hourly_cost)
-            
-            if cost_efficiency > 0.7:  # Very efficient (cost < 79)
-                reward = 1.0
-            elif cost_efficiency < 0.3:  # Inefficient (cost > 185)
-                reward = -1.0
-            else:
-                reward = 0.0
-                
-        elif action_type == 'plan':
-            case_id = outcome_data
-            if case_id in self.wait_intake:
-                waiting_time = self.wait_intake[case_id]
-                # Reward based on waiting time (aligns with waiting_time_for_admission)
-                # Planning constraint: must plan ≥24 hours ahead
-                # Good: 24-48 hours (proper planning)
-                # Bad: >72 hours (too much delay)
-                if 24 <= waiting_time <= 48:  # Good: proper planning window
-                    reward = 1.0
-                elif waiting_time > 72:  # Bad: excessive delay
-                    reward = -1.0
-                elif waiting_time < 24:  # Bad: violates planning constraint
-                    reward = -0.5
-                else:
-                    reward = 0.0
-                    
-        elif action_type == 'nervousness':
-            # Reward based on replanning frequency (aligns with nervousness)
-            replan_penalty = outcome_data
-            # Nervousness penalty: max(0, 336 - (old_tp - tr)) / 336
-            # 336 = 2 weeks, penalty increases as replanning gets closer to deadline
-            if replan_penalty < 0.1:  # Low nervousness (good)
-                reward = 0.5
-            elif replan_penalty > 0.5:  # High nervousness (bad)
-                reward = -1.0
-            else:
-                reward = 0.0
-                
-        elif action_type == 'hospital_wait':
-            # Reward based on in-hospital waiting time (aligns with waiting_time_in_hospital)
-            hospital_wait_time = outcome_data
-            # Typical nursing durations: A1(4h), A2(8h), A3/A4(16h), B1(8h), B2/B3/B4(16h)
-            # Good: <2 days (48h), Bad: >5 days (120h)
-            if hospital_wait_time < 48:  # Good: efficient hospital flow
-                reward = 1.0
-            elif hospital_wait_time > 120:  # Bad: excessive hospital stay
-                reward = -1.0
-            else:
-                reward = 0.0
-        
-        # Find and assign rewards to pending actions
-        processed_actions = []
-        for i, (timestamp, state, action, mask, case_id, pending_action_type) in enumerate(self.pending_actions):
-            if pending_action_type == action_type:
-                # Calculate time delay
-                delay = current_time - timestamp
-                
-                # Apply time decay to reward (older actions get less credit)
-                # Decay over 1 week (168 hours) to handle long-delay scenarios
-                decay_factor = max(0.1, 1.0 - (delay / 168.0))
-                adjusted_reward = reward * decay_factor
-                
-                # Store the experience with delayed reward
-                self._remember(state, action, mask, adjusted_reward, None, False)
-                processed_actions.append(i)
-        
-        # Remove processed actions
-        for i in reversed(processed_actions):
-            self.pending_actions.pop(i)
-            
-        return len(processed_actions)  # Return number of processed actions
-
     def _build_structured_state(self, now):
         """Create structured state vector with fixed slots per diagnosis"""
         
         # Initialize state components
-        slot_data = []  # case_id and waiting_time for each slot
+        slot_data = []  # features for each slot
         diagnosis_counts = [0] * 9  # count of cases per diagnosis
         
         # Fill slots for each diagnosis
-        slot_idx = 0
         for diagnosis, num_slots in self.slots_per_diagnosis.items():
             queue = self.diagnosis_queues[diagnosis]
             diagnosis_idx = self.diagnosis_encoding[diagnosis]
@@ -399,13 +360,10 @@ class DQNPlanner(Planner):
             for i in range(num_slots):
                 if i < len(queue):
                     case_id = queue[i]
-                    waiting_time = now - self.arrival_times.get(case_id, now)
-                    slot_data.extend([hash(case_id) % 10000, waiting_time])
+                    slot_data.extend(self._slot_features(case_id, diagnosis, now))
                     diagnosis_counts[diagnosis_idx] += 1
                 else:
-                    # Empty slot
-                    slot_data.extend([0, 0])
-                slot_idx += 1
+                    slot_data.extend([0.0, 0.0])
         
         # Resource information
         fut = [self.resources_now[rt] for rt in ResourceType]
@@ -421,8 +379,9 @@ class DQNPlanner(Planner):
                            dtype=torch.float32).unsqueeze(0)
 
         # ------------------- ACTION ENCODING -------------------------
-        plan_actions  = []   # [(cid, adm_time)]
-        sched_actions = []   # [(ResourceType, t, n)]
+        total_plan_slots = self.total_slots * 24
+        plan_actions  = [None] * total_plan_slots
+        sched_actions = []   # [((or,a,b), t_eff)]
         mask          = torch.zeros(self.action_dim, dtype=torch.uint8).unsqueeze(0)
 
         # 1. Plan actions: one action per slot per time window
@@ -435,26 +394,21 @@ class DQNPlanner(Planner):
                     earliest = now + 24     # ≥ one day ahead
                     for h in range(24):     # 24 hourly slots
                         adm = earliest + h
-                        plan_actions.append((case_id, adm))
-                        if adm >= earliest: mask[0, idx] = 1
+                        plan_actions[idx] = (case_id, adm)
+                        mask[0, idx] = 1
                         idx += 1
                 else:
-                    # Empty slot - no valid actions
                     idx += 24
 
-        # 2. Schedule actions (same as before)
-        for dr_or in (-1,0,1):
-            for dr_ab in (-1,0,1):
-                for dr_bb in (-1,0,1):
-                    new_or = min(5, max(0, self.resources_now[ResourceType.OR]+dr_or))
-                    new_ab = min(30,max(0, self.resources_now[ResourceType.A_BED]+dr_ab))
-                    new_bb = min(40,max(0, self.resources_now[ResourceType.B_BED]+dr_bb))
-                    t_eff  = now + 14
-                    # respect decrease-only-after-1week rule
-                    if dr_or<0 or dr_ab<0 or dr_bb<0:
-                        t_eff = now + 168
-                    sched_actions.append((ResourceType.OR, t_eff, new_or))
-                    # the three resource types share the same tuple for simplicity
+        # 2. Schedule actions: set OR, A_BED, B_BED together
+        for dr_or in (-1, 0, 1):
+            for dr_ab in (-1, 0, 1):
+                for dr_bb in (-1, 0, 1):
+                    new_or = min(5, max(0, self.resources_now[ResourceType.OR] + dr_or))
+                    new_ab = min(30, max(0, self.resources_now[ResourceType.A_BED] + dr_ab))
+                    new_bb = min(40, max(0, self.resources_now[ResourceType.B_BED] + dr_bb))
+                    t_eff = self._next_effective_time(now, dr_or, dr_ab, dr_bb)
+                    sched_actions.append(((new_or, new_ab, new_bb), t_eff))
                     mask[0, idx] = 1
                     idx += 1
 
@@ -473,31 +427,31 @@ class DQNPlanner(Planner):
             q = self.net(state, mask)
             return int(torch.argmax(q).item())
 
-    # store + learn ---------------------------------------------------
-    def _remember(self, s, a, m, reward, s2, done):
-        if self.train_mode:
-            self.mem.push(s, a, reward, s2, done, m)
-            if len(self.mem) >= self.BATCH:
-                self._learn()
-
+    # learning --------------------------------------------------------
     def _learn(self):
         batch = self.mem.sample(self.BATCH)
-        non_final = torch.tensor([s is not None for s in batch.next_state])
-        non_next  = torch.cat([s for s in batch.next_state if s is not None], dim=0) \
-            if any(non_final) else None
-        state     = torch.cat(batch.state)
-        action    = torch.tensor(batch.action).unsqueeze(1)
-        reward    = torch.tensor(batch.reward, dtype=torch.float32).unsqueeze(1)
-        mask      = torch.cat(batch.mask)
+        non_final_mask = [i for i, s in enumerate(batch.next_state) if s is not None]
+        state = torch.cat(batch.state)
+        action = torch.tensor(batch.action).unsqueeze(1)
+        reward = torch.tensor(batch.reward, dtype=torch.float32).unsqueeze(1)
+        mask = torch.cat(batch.mask)
 
-        q_sa      = self.net(state, mask).gather(1, action)
-        q_next    = torch.zeros_like(q_sa)
-        if any(non_final):
+        q_sa = self.net(state, mask).gather(1, action)
+        q_next = torch.zeros_like(q_sa)
+        if non_final_mask:
+            non_next = torch.cat([batch.next_state[i] for i in non_final_mask], dim=0)
+            next_masks = torch.cat([batch.next_mask[i] for i in non_final_mask], dim=0)
             with torch.no_grad():
-                best = torch.argmax(self.net(non_next, None), dim=1, keepdim=True)
-                q_next[non_final] = self.tgt(non_next, None).gather(1, best)
-        target = reward + self.GAMMA * q_next * (~torch.tensor(batch.done).unsqueeze(1))
-        loss   = nn.functional.smooth_l1_loss(q_sa, target)
+                q_online = self.net(non_next, None)
+                q_online[next_masks == 0] = -1e9
+                a_star = q_online.argmax(dim=1, keepdim=True)
+                q_target = self.tgt(non_next, None)
+                q_next_vals = q_target.gather(1, a_star)
+                for idx, bf in enumerate(non_final_mask):
+                    q_next[bf] = q_next_vals[idx]
+        done = torch.tensor(batch.done).unsqueeze(1).float()
+        target = reward + self.GAMMA * q_next * (1 - done)
+        loss = nn.functional.smooth_l1_loss(q_sa, target)
         self.opt.zero_grad(); loss.backward(); self.opt.step()
 
         if self.step_counter % self.TARGET_UPD == 0:
