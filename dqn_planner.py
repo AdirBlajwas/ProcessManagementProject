@@ -157,7 +157,7 @@ class DQNPlanner(Planner):
             self.wta_open.discard(case_id)
 
         # Nervousness: replanning close to execution
-        if lifecycle == EventType.PLAN_UPDATED and data and 'old_tp' in data:
+        if lifecycle == EventType.PLAN_EVENTS and data and 'old_tp' in data:
             old_tp = data['old_tp']
             nerv = max(0.0, 336 - (old_tp - ts)) / 336.0
             self._credit_last_plan(case_id, -nerv)
